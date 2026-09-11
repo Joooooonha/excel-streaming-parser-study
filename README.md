@@ -42,15 +42,15 @@ flowchart TD
 
 ## 핵심 결론
 
-초기에는 업로드 과정의 `byte[]`를 재사용해 S3 GET 한 번을 줄이는 것을 주요 최적화 대상으로 보았습니다. 하지만 측정 결과 원본 파일보다 Workbook 전체 객체와 파싱 결과를 동시에 유지하는 구조가 훨씬 큰 heap 압력을 만들었습니다.
+업로드 과정에서 생성된 `byte[]`를 파싱 단계까지 재사용해, 원본 저장 뒤 다시 S3에서 읽던 접근을 파일당 2회(`PUT + GET`)에서 1회(`PUT`)로 줄였습니다. 이 과정에서 데이터가 queue와 parser에 오래 남아 동시 처리 여유가 줄어드는 문제가 드러났고, 원본 파일보다 Workbook 전체 객체와 파싱 결과를 동시에 유지하는 구조가 훨씬 큰 heap 압력을 만든다는 점을 측정으로 확인했습니다.
 
 | 구분 | 처음 본 문제 | 측정 후 다시 정의한 문제 |
 |---|---|---|
 | 주요 비용 | object storage 재조회 | Workbook·Row·Cell과 전체 결과의 긴 생명주기 |
 | 제어 대상 | inline `byte[]` queue | 파서 구조, 출력 방식과 전체 동시 작업 수 |
-| 선택 | 작은 파일 fast path 검토 | SAX 행 단위 파싱 + streaming output |
+| 선택 | 업로드 데이터 재사용으로 GET 생략 | bounded inline reuse + durable fallback + SAX·출력 스트리밍 |
 
-> 제한된 heap에서 가변 크기의 `.xlsx`를 처리할 때는 S3 재조회 한 번을 줄이는 것보다 Workbook 전체 로딩과 전체 결과 적재를 제거하는 것이 우선입니다. 파싱과 출력을 함께 스트리밍하고 전체 parser 동시성을 공유 제한하는 방향을 채택했습니다.
+> 검증된 소형 파일은 업로드 데이터를 bounded inline queue에서 재사용해 S3 GET을 생략합니다. 대형 파일·queue 포화·재시도는 object key 기반 durable 경로로 처리합니다. 두 경로 모두 SAX 행 단위 파싱과 출력 스트리밍을 사용하고, 공유 permit으로 전체 동시 작업을 제한합니다.
 
 ## 가설의 전개와 판단 과정
 
@@ -232,21 +232,24 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A["업로드 요청"] --> B["원본 저장"]
-    B --> C["PENDING + durable job"]
-    C --> D["공유 제한 worker"]
-    D --> E["SAX 행 파싱"]
-    E --> F["streaming JSON · temp file"]
-    F --> G{"최종 저장"}
-    G -->|성공| H["DONE"]
-    G -->|실패| I["FAILED + 사유"]
+    A["업로드 byte[]"] --> B["S3 PUT + PENDING"]
+    B --> C{"inline 조건 충족?"}
+    C -->|소형·queue 여유| D["bounded inline queue · byte[]"]
+    C -->|대형·포화·재시도| E["durable job · id + object key"]
+    E --> F["S3 GET"]
+    D --> G["공유 parse permits"]
+    F --> G
+    G --> H["SAX + streaming output"]
+    H --> I{"최종 저장"}
+    I -->|성공| J["DONE"]
+    I -->|실패| K["FAILED + 사유"]
 ```
 
 | 영역 | 설계 결정 | 이유 |
 |---|---|---|
 | 파싱 | `.xlsx`를 SAX 행 단위로 처리 | 전체 Workbook 객체 그래프 제거 |
 | 출력 | `JsonGenerator`와 buffer로 임시 파일에 순차 기록 | 전체 rows와 JSON bytes의 동시 적재 방지 |
-| 작업 전달 | raw bytes 대신 id와 object key 전달 | queue 대기 중 원본 데이터의 heap 점유 방지 |
+| 작업 전달 | 소형은 bounded `byte[]` 재사용, 대형·포화·재시도는 id + object key | GET 생략과 durable 복구를 함께 유지 |
 | 동시성 | 모든 파싱 경로가 공유하는 permit 적용 | queue별 worker 합산으로 동시 실행이 늘어나는 문제 방지 |
 | 상태 | 최종 저장 성공 뒤 `DONE`, 오류 시 `FAILED` | 파싱 성공과 결과 저장 성공을 구분 |
 | 복구 | 임시 파일 정리, idempotency와 `PENDING` 복구 정책 | 실패·재시작 조건에서 중복과 잔여 파일 방지 |
@@ -255,33 +258,46 @@ flowchart TD
 
 ### 계산으로 정한 초기 동시성·큐 설정
 
-동시 실행 자체를 운영 트래픽으로 부하 시험한 기록은 없지만, 확보한 heap 관측값으로 **첫 배포에 사용할 보수적인 admission 상한**은 계산할 수 있습니다. 계산에서는 관측 환경의 MaxHeap 478MiB 중 25%를 GC 변동과 다른 요청을 위한 여유로 남겼습니다.
+관측 환경의 MaxHeap `478MiB` 중 25%를 GC 변동과 다른 요청을 위한 여유로 남겨, admission 예산을 `358.5MiB`로 두었습니다. queue는 검증된 소형 파일만 `1MiB` 이하로 최대 4건 보관하도록 계산했습니다.
 
 ```text
-사용 가능 예산 = 478MiB × 0.75 = 358.5MiB
+사용 가능 예산 = 478 × 0.75 = 358.5MiB
 
-관측 baseline                         = 73MiB
-large SAX의 GC 직전 관측값            = 222MiB
-large 1건의 증가분                    = 222 - 73 = 149MiB
-small 1건의 보수적 증가분             = 124.3MiB
-                                      (Workbook 5k 측정값을 상한 근사로 사용)
-
-large 2건 예상 = 73 + 149 × 2     = 371.0MiB  → 예산 초과
-large 1 + small 1 = 73 + 149 + 124.3 = 346.3MiB → 여유 12.2MiB로 제외
-small 2건 예상 = 73 + 124.3 × 2   = 321.6MiB  → 예산 내
+baseline/post-GC 관측 상한               = 73MiB
+small 1건의 보수적 증가분                = 124.3MiB
+  └ Workbook 5,000행 관측값을 proxy로 사용
+large 1건의 SAX 증가분                   = 222 - 73 = 149MiB
+inline 대기 원본                         = 1MiB × 4건 = 4MiB
 ```
 
-| 설정 | 초기값 | 계산·판단 |
+| 실행 조합 | 계산 | 예상 점유 | 결정 |
+|---|---:|---:|---|
+| small 2건 + inline queue | `73 + 124.3×2 + 4` | `325.6MiB` | 허용, 예산 내 여유 `32.9MiB` |
+| large 1건 + small 1건 + queue | `73 + 149 + 124.3 + 4` | `350.3MiB` | 여유가 `8.2MiB`뿐이라 제외 |
+| large 2건 + inline queue | `73 + 149×2 + 4` | `375.0MiB` | 예산 초과 |
+
+| 설정 | 초기값 | 적용 방식 |
 |---|---:|---|
-| parser worker 최대 수 | 2 | small 작업 두 건까지만 허용 |
-| 공유 permit | 2 | 모든 파싱 경로가 같은 예산 사용 |
-| small 작업 weight | 1 | 두 건 동시 실행 가능 |
-| large 작업 weight | 2 | 한 건이 전체 permit을 점유 |
-| executor 대기 queue | 4 jobs | worker 상한의 2배로 제한해 JVM 내부 대기열에 backpressure 적용 |
-| raw `byte[]` inline queue | 0 | 대기열에는 id와 object key만 보관 |
+| 공유 parse permits | 2 | 모든 파싱 경로가 같은 예산 사용 |
+| small 작업 weight | 1 | small 2건 동시 실행 가능 |
+| large 작업 weight | 2 | large 1건이 전체 permit 점유 |
+| inline queue capacity | 4 jobs | worker 밖에서 대기하는 raw data 상한 |
+| inline threshold | 1MiB | 5,000행 합성 파일 `0.580MiB`를 위로 둥글린 초기 routing 값 |
+| durable fallback | 항상 유지 | 대형·queue 포화·재시도는 id와 object key 전달 |
 
-`small`은 사전 검증으로 5,000행·100,020셀 이하가 확인된 입력만 허용하고, 분류할 수 없으면 `large`로 취급합니다. 따라서 계산 결과의 동시 처리 상한은 **small 2건 또는 large 1건**입니다. 이는 단일 실행 기록에서 도출한 초기 안전 설정이며, 처리량·지연·비용이 확인된 운영 최적값은 아닙니다.
+`small`은 압축 크기 `1MiB` 이하이면서 업로드 단계에서 5,000행·100,020셀 이하임을 검증할 수 있는 입력입니다. 행·셀 수를 알 수 없으면 inline으로 추정하지 않고 durable 경로로 보냅니다. 이 수치는 실제 동시 트래픽의 최대 처리량이 아니라 단일 실행 관측값에서 출발한 **보수적인 초기 admission policy**입니다.
 
+### S3 접근과 비용 해석
+
+```text
+기존 경로  = PUT 1회 + 파싱용 GET 1회 = 파일당 S3 접근 2회
+inline 경로 = PUT 1회                  = 파일당 S3 접근 1회
+
+접근 횟수 감소율 = (2 - 1) / 2 × 100 = 50%
+직접 절감량       = inline 처리 건수 × GET 요청 단가 1회분
+```
+
+따라서 **inline 파일의 S3 접근 횟수를 50% 줄였다**는 결론은 성립합니다. 다만 전체 AWS 청구액에는 저장 용량, PUT, 데이터 전송, 다른 서비스와 durable 경로의 GET도 포함되므로 전체 비용이 50% 감소했다고 확대하지 않습니다.
 ## 연구의 마무리
 
 이 연구는 “더 검증해야 한다”는 문장으로 끝난 작업이 아니라, 제한된 heap 환경에서 어떤 파싱 구조를 선택해야 하는지 결정하기 위한 기술 조사였습니다.
@@ -291,7 +307,7 @@ small 2건 예상 = 73 + 124.3 × 2   = 321.6MiB  → 예산 내
 | Excel 업로드·비동기 파싱 기능 구현 | 실제 배포 범위와 장애율 변화 |
 | Workbook 기준선과 SAX + streaming output 대안 구현·실행 | 반복 실행의 평균·p95/p99 |
 | 주된 메모리 병목과 Workbook 방식의 위험 범위 확인 | 최종 최대 업로드 크기·행·셀 수 |
-| GC 관측값으로 small 2건 또는 large 1건, queue 4건의 초기 상한 계산 | 실제 트래픽의 처리량·queue wait와 안정성 |
+| bounded 재사용을 포함해 small 2건 또는 large 1건, inline queue 4건의 초기 상한 계산 | 실제 트래픽의 처리량·queue wait와 안정성 |
 | 작업 상태·실패·복구를 포함한 구조 결정 | S3·DB 포함 end-to-end 시간과 비용 변화 |
 
 따라서 결과는 기능을 설계만 한 상태가 아니라, **Workbook 기준선과 SAX 대안을 구현·실행해 파싱 구조를 결정하고 초기 동시성·큐 값을 계산한 상태**입니다. 오른쪽 항목은 구현 여부가 아니라 서비스 트래픽·배포 환경에서 그 값의 처리량, 안정성과 비용 효과를 확인하는 운영 검증 범위입니다.
@@ -301,8 +317,8 @@ small 2건 예상 = 73 + 124.3 × 2   = 321.6MiB  → 예산 내
 | 구분 | 내용 |
 |---|---|
 | 실험으로 확인 | Workbook 50,000행의 512MiB·768MiB OOM, SAX 스트리밍 512MiB 완료, 두 방식의 GC 패턴 차이 |
-| 계산으로 결정 | MaxHeap 25% 여유 기준 small 2건 또는 large 1건, executor queue 4건, raw byte queue 미사용 |
-| 설계에 반영 | Workbook·전체 결과 적재 제거, durable job, 공유 동시성 제한, 상태·실패 처리 |
+| 계산으로 결정 | MaxHeap 25% 여유 기준 small 2건 또는 large 1건, inline queue 4건(`1MiB` 이하) |
+| 설계에 반영 | bounded inline reuse, durable fallback, SAX·출력 스트리밍, 공유 동시성·상태·실패 처리 |
 | 별도 운영 검증 | 반복 평균·p95/p99, 동시 처리량, S3·DB 포함 시간, 실제 비용과 최종 지원 상한 |
 | 기능 정합성 검증 | 수식·날짜·병합 셀·여러 sheet 등 다양한 Excel 의미의 동등성 확인 |
 
