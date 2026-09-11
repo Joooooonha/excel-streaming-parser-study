@@ -381,32 +381,33 @@ Workbook full load
 → buffered temp file
 
 운영 방향
-raw byte[] 장기 보관 지양
+raw byte[]는 검증된 소형 파일의 bounded queue에서만 재사용
 전체 parser 공유 동시성 제한
 완료 후 최종 저장
 ```
 
 50,000행 입력이 SAX 방식에서 `-Xmx512m`으로 완료된 것은 파싱 전략 전환의 근거입니다. 그러나 이를 운영 상한, 평균 성능 개선율 또는 비용 절감률로 확대 해석하지 않습니다.
 
-## 14. 관측값으로 계산한 초기 동시성 상한
+## 14. 관측값으로 계산한 초기 동시성·큐 상한
 
-운영 환경에서 확인한 MaxHeap 478MiB의 25%를 변동 여유로 남기면 파싱 admission에 사용할 예산은 358.5MiB입니다.
+MaxHeap `478MiB` 중 25%를 변동 여유로 남기면 admission 예산은 `358.5MiB`입니다. inline queue는 검증된 소형 파일을 `1MiB` 이하로 4건까지 보관하는 조건을 함께 넣었습니다.
 
 | 계산 항목 | 식 | 결과 |
 |---|---:|---:|
-| large 1건 증가분 | 222 - 73 | 149.0MiB |
-| large 2건 | 73 + 149 × 2 | 371.0MiB |
-| large 1건 + small 1건 | 73 + 149 + 124.3 | 346.3MiB |
-| small 2건 | 73 + 124.3 × 2 | 321.6MiB |
+| large 1건 증가분 | `222 - 73` | `149.0MiB` |
+| inline 대기 원본 | `1 × 4` | `4.0MiB` |
+| small 2건 + queue | `73 + 124.3×2 + 4` | `325.6MiB` |
+| large 1건 + small 1건 + queue | `73 + 149 + 124.3 + 4` | `350.3MiB` |
+| large 2건 + queue | `73 + 149×2 + 4` | `375.0MiB` |
 
 - `73MiB`: SAX Young GC 뒤의 높은 쪽 관측값
 - `222MiB`: SAX GC 직전의 높은 쪽 관측값
-- `124.3MiB`: Workbook 5,000행의 파싱 직후 heap 증가. small SAX 직접 측정값이 없어 보수적 상한 근사로 사용
+- `124.3MiB`: small SAX 직접 측정값이 없어 Workbook 5,000행 값을 보수적 proxy로 사용
+- `4MiB`: `1MiB` 이하 raw bytes를 inline queue에 최대 4건 보관하는 상한
 
-large 2건은 예산을 넘고, large 1건과 small 1건은 12.2MiB만 남아 측정 오차와 다른 요청을 감당하기 어렵습니다. small 2건은 36.9MiB를 남깁니다. 따라서 **공유 permit 2개, small weight 1, large weight 2**로 계산해 small 2건 또는 large 1건만 실행하도록 정했습니다.
+small 2건은 예산 안에서 `32.9MiB`를 남깁니다. large 1건과 small 1건은 `8.2MiB`만 남고, large 2건은 예산을 넘으므로 제외했습니다. 따라서 **공유 permit 2개, small weight 1, large weight 2**로 small 2건 또는 large 1건만 실행하도록 계산했습니다.
 
-executor queue는 worker 최대 수 2의 두 배인 4건으로 제한하고 id와 object key만 보관합니다. 이 값은 JVM 대기열의 backpressure를 위한 초기 설정이지, 실제 도착률과 처리시간으로 계산한 처리량 최적값은 아닙니다.
-
+inline threshold `1MiB`는 5,000행 합성 파일 `0.580MiB`를 위로 둥글린 초기 routing 값이고, queue 4건은 raw 대기 데이터를 `4MiB`로 제한합니다. 이 값은 실제 도착률과 처리시간으로 계산한 처리량 최적값이 아니라 단일 실행 관측값으로 정한 초기 admission policy입니다.
 ## 15. 운영 적용을 위한 추가 측정
 
 운영 조건을 정하기 전에는 다음 세 방식을 같은 조건에서 비교해, 읽기 방식과 출력 방식의 효과를 분리해야 합니다.
