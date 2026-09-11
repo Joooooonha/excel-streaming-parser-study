@@ -1,0 +1,14 @@
+.DS_Store
+.idea/
+.gradle/
+build/
+out/
+*.class
+*.jar
+*.jfr
+*.hprof
+gc-*.log
+outputs/
+samples/*.xlsx
+samples/*.xls
+tmp/
