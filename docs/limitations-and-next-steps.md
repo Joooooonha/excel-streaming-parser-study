@@ -13,7 +13,8 @@
 - 같은 입력의 SAX 스트리밍 실행이 `-Xmx512m`에서 완료
 - 원본 `byte[]`보다 파싱 객체와 전체 결과가 더 큰 위험으로 관측됨
 - 출력까지 스트리밍하고 전체 parser 동시성을 제한해야 한다는 설계 근거 확보
-- 관측값과 25% heap 여유를 기준으로 small 2건 또는 large 1건, executor queue 4건의 초기 admission 값 계산
+- 업로드 `byte[]` 재사용으로 inline 파일의 S3 접근을 2회에서 1회로 줄임
+- 관측값과 25% heap 여유를 기준으로 small 2건 또는 large 1건, inline queue 4건의 초기 admission 값 계산
 
 ### 운영 적용 단계에서 별도로 확인할 내용
 
@@ -147,9 +148,17 @@ SAX로 parser heap을 낮춰도 최종 JSON을 JSONB로 저장하는 과정에�
 | object storage JSON | upload time, download time, URL·권한 관리 |
 | row batch | batch size, transaction time, index cost |
 
-## 8. S3 비용 해석
+## 8. S3 접근과 비용 해석
 
-inline 경로는 처리 한 건당 GET 요청 한 번을 줄일 수 있지만 비용 절감률은 다음 정보 없이는 계산할 수 없습니다.
+```text
+기존 경로:  PUT 1 + 파싱용 GET 1 = 파일당 S3 접근 2회
+inline 경로: PUT 1                = 파일당 S3 접근 1회
+
+접근 횟수 감소율 = (2 - 1) / 2 × 100 = 50%
+직접 절감량       = inline 처리 건수 × GET 요청 단가 1회분
+```
+
+따라서 inline으로 처리된 파일은 S3 접근 횟수가 50% 감소하고 GET 요청 비용을 줄입니다. 다만 전체 AWS 청구 비용 감소율은 다음 값 없이는 계산할 수 없습니다.
 
 ```text
 request pricing
@@ -162,8 +171,7 @@ storage duration
 other service usage
 ```
 
-따라서 문서에서는 “GET 요청 한 번 생략 가능”까지만 말하고 “AWS 비용 50% 절감”처럼 표현하지 않습니다.
-
+문서에서는 “파일당 S3 접근을 50% 줄였다”와 “GET 비용 절감에 기여했다”까지 결론으로 둡니다. 이를 “전체 AWS 비용이 50% 절감됐다”로 확대하지 않습니다.
 ## 9. 운영 상한 결정
 
 지원 범위는 서버가 간신히 버틴 최대값이 아닙니다.
@@ -229,9 +237,10 @@ parser_worker_max: 2
 parse_permits: 2
 small_job_weight: 1
 large_job_weight: 2
-executor_queue_capacity: 4
-inline_raw_byte_queue_capacity: 0
-queue_payload: id_and_object_key
+inline_queue_capacity: 4
+inline_threshold: "1MiB"
+inline_validated_profile: "up to 5,000 rows / 100,020 cells"
+durable_fallback: id_and_object_key
 
 max_compressed_bytes: TBD
 max_uncompressed_bytes: TBD
@@ -242,7 +251,7 @@ retry_limit: TBD
 result_storage: TBD
 ```
 
-위 동시성·queue 수치는 기록된 heap 값으로 계산한 초기 admission 설정입니다. 실제 트래픽에서의 처리량·p95 지연·queue wait·장애율과 비용 절감 효과는 아직 측정값이 아니며, 운영 telemetry에 따라 더 낮추거나 높입니다.
+위 동시성·queue 수치는 기록된 heap 값과 `1MiB × 4 = 4MiB`의 inline 대기 원본 예산으로 계산한 초기 admission 설정입니다. 실제 트래픽에서의 처리량·p95 지연·queue wait·장애율과 전체 비용 절감 효과는 운영 telemetry에 따라 재검증합니다.
 
 ## 11. 기록 보존과 공개 재현
 
