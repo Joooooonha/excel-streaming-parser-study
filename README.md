@@ -9,7 +9,7 @@
 
 - [연구 개요](#연구-개요)
 - [핵심 결론](#핵심-결론)
-- [판단 과정](#판단-과정)
+- [가설의 전개와 판단 과정](#가설의-전개와-판단-과정)
 - [실험과 결과](#실험과-결과)
 - [최종 설계](#최종-설계)
 - [연구의 마무리](#연구의-마무리)
@@ -52,7 +52,64 @@ flowchart TD
 
 > 제한된 heap에서 가변 크기의 `.xlsx`를 처리할 때는 S3 재조회 한 번을 줄이는 것보다 Workbook 전체 로딩과 전체 결과 적재를 제거하는 것이 우선입니다. 파싱과 출력을 함께 스트리밍하고 전체 parser 동시성을 공유 제한하는 방향을 채택했습니다.
 
-## 판단 과정
+## 가설의 전개와 판단 과정
+
+### 1. 최초 가설: 업로드 `byte[]` 재사용
+
+업로드 요청에서는 object storage로 보낼 원본 `byte[]`가 이미 만들어집니다. 이 값을 작은 용량의 JVM inline queue로 넘기면 파싱 worker가 파일을 다시 조회하지 않아도 되므로, **작은 파일은 메모리에서 바로 처리하고 큰 파일은 object key만 전달하는 이중 경로**를 처음 검토했습니다.
+
+```mermaid
+flowchart TD
+    A["업로드 byte[]"] --> B{"작은 파일이며<br>queue 여유가 있는가"}
+    B -->|예| C["inline queue · byte[] 재사용"]
+    B -->|아니오| D["durable job · object key"]
+    C --> E["파싱"]
+    D --> F["원본 조회"]
+    F --> E
+```
+
+가설의 첫 메모리 예산은 다음과 같이 단순했습니다.
+
+```text
+queuedRawBytes = inlineQueueCapacity × inlineThreshold
+
+예시
+inlineThreshold = 1MiB
+queueCapacity   = 4
+queuedRawBytes  = 4MiB
+```
+
+| 가설이 유효한 조건 | 가설을 수정해야 하는 조건 |
+|---|---|
+| 원본 `byte[]`가 작업당 메모리의 큰 비중을 차지 | Workbook과 결과 객체가 원본보다 훨씬 큼 |
+| inline queue의 상한만으로 heap 점유를 제한 가능 | 실행 중인 parser 수가 heap 압력을 좌우 |
+| S3 재조회 생략이 주요 병목을 줄임 | 파싱 객체 생성·유지가 더 큰 병목 |
+
+### 2. 환경 조사: 실제 메모리 예산 재계산
+
+운영 환경의 특정 시점을 조사했을 때 서버 RAM은 약 1.9GiB, JVM MaxHeap은 약 478MiB였고 swap은 없었습니다. JVM heap만 늘리면 OS, native memory, thread stack과 같은 영역의 여유가 줄어들기 때문에 다음 항목을 함께 예산에 넣었습니다.
+
+```text
+처리 중 필요한 heap
+= 대기 중인 원본 byte[]
+ + 실행 중인 Workbook / Sheet / Row / Cell
+ + 전체 파싱 결과 List
+ + JSON 직렬화 결과
+ + worker별 중간 객체
+ + GC 및 운영 안전 여유
+```
+
+이 계산으로 질문은 “queue에 원본을 몇 개 넣을 수 있는가?”에서 “**파싱 한 건이 만드는 전체 live set을 제한할 수 있는가?**”로 바뀌었습니다.
+
+### 3. 반례와 수정 가설
+
+Workbook 방식으로 입력 크기를 늘려 측정한 결과, 2.306MiB의 압축 파일도 400,020개 셀을 객체로 펼치고 전체 결과를 유지하면서 파싱 직후 heap이 약 408.8MiB 증가했습니다. 5.753MiB 파일은 `-Xmx512m`과 `-Xmx768m`에서 모두 OOM이 발생했습니다.
+
+따라서 최초 가설을 폐기한 것이 아니라 적용 범위를 줄였습니다. S3 GET 생략은 작은 파일의 보조 최적화가 될 수 있지만, 기본 파싱 구조는 다음 수정 가설을 먼저 만족해야 했습니다.
+
+> 전체 Workbook과 결과를 동시에 유지하지 않고 행 단위로 읽고 쓰면, 입력 행 수가 증가해도 live set을 제한된 범위에서 반복 회수할 수 있다.
+
+### 4. 판단 흐름
 
 ```mermaid
 flowchart TD
@@ -76,7 +133,17 @@ flowchart TD
 
 ## 실험과 결과
 
-### 조건
+### 실험 질문
+
+```text
+Q1. 원본 xlsx byte[]가 heap 사용의 주된 원인인가?
+Q2. Workbook 객체와 전체 파싱 결과는 입력 규모에 따라 얼마나 커지는가?
+Q3. 512MiB급 heap에서 Workbook 방식의 위험은 어디서 드러나는가?
+Q4. SAX + streaming output은 같은 대규모 입력을 제한된 heap에서 완료하는가?
+Q5. GC 로그에서 두 방식의 객체 회수 패턴은 어떻게 다른가?
+```
+
+### 비교 조건
 
 | 항목 | Workbook 기준선 | SAX 비교안 |
 |---|---|---|
@@ -88,6 +155,35 @@ flowchart TD
 | 측정 | 단계별 used heap·시간 | GC log |
 
 S3, DB, HTTP와 운영 트래픽은 제외해 파서 구조의 메모리 특성을 분리했습니다.
+
+<details>
+<summary><strong>측정 지점과 수치 해석</strong></summary>
+
+Workbook 기준선에서는 파일 읽기, Workbook 파싱, JSON 직렬화 직후의 used heap을 각각 기록했습니다.
+
+```java
+long heapBefore = usedHeap();
+
+byte[] bytes = Files.readAllBytes(path);
+long heapAfterRead = usedHeap();
+
+ParsedExcelData data = parseWithWorkbook(bytes);
+long heapAfterParse = usedHeap();
+
+byte[] json = objectMapper.writeValueAsBytes(data);
+long heapAfterJson = usedHeap();
+```
+
+```java
+private static long usedHeap() {
+    Runtime runtime = Runtime.getRuntime();
+    return runtime.totalMemory() - runtime.freeMemory();
+}
+```
+
+이 값은 각 코드 체크포인트의 used heap입니다. 샘플링 사이의 순간 최대값을 보장하지 않으므로 `peak heap`이라고 부르지 않았습니다. SAX 방식은 GC 이벤트 전후 값을 사용했으므로 두 측정은 절대값을 직접 비교하기보다 객체 생명주기와 OOM 여부를 함께 해석했습니다.
+
+</details>
 
 ### Workbook 결과
 
@@ -118,6 +214,17 @@ flowchart TD
     D["SAX 행 객체"] --> E["짧은 객체 생명주기"]
     E --> F["Young GC에서 반복 회수"]
 ```
+
+### 결과 해석
+
+| 관측 | 해석 | 설계에 반영한 내용 |
+|---|---|---|
+| 2.306MiB 파일에서 파싱 직후 heap 약 408.8MiB 증가 | 압축 파일 크기는 객체 그래프 크기를 대표하지 못함 | 업로드 크기뿐 아니라 행·셀·출력 크기를 함께 제한 |
+| 50,000행이 512MiB·768MiB에서 OOM | Xmx 증설만으로 객체 생명주기 문제를 해결하기 어려움 | Workbook 전체 로딩을 기본 경로에서 제거 |
+| SAX 50,000행이 512MiB에서 완료 | 행 단위 처리와 출력 스트리밍이 live set 제한에 유효 | SAX + `JsonGenerator` + buffered temp file 채택 |
+| Young GC 뒤 약 69–73MiB로 반복 회수 | 행 단위 중간 객체가 짧게 살아남는 패턴 | parser 전체 동시성을 제한해 동시 live set 제어 |
+
+이 실험은 단순히 SAX 라이브러리가 더 빠른지를 비교한 것이 아닙니다. **Workbook 전체 모델과 전체 결과를 동시에 유지하는 설계**와 **행 이벤트를 받아 출력까지 순차 처리하는 설계**를 비교해, 메모리 안전성을 만드는 객체 생명주기의 차이를 확인한 것입니다.
 
 원시 수치, 측정 지점과 해석은 [실험 보고서](docs/experiment-report.md) 및 [결과 CSV](results/workbook-measurements.csv)에서 확인할 수 있습니다.
 
@@ -181,6 +288,23 @@ flowchart TD
 | 결론을 어디까지 적용할 수 있는가 | [검증 범위와 후속 확인](docs/limitations-and-next-steps.md) |
 | Workbook 원시 측정값 | [workbook-measurements.csv](results/workbook-measurements.csv) |
 | GC 이벤트 관측값 | [gc-observations.csv](results/gc-observations.csv) |
+
+### 간소화 전 세부 내용의 보존 위치
+
+README를 읽기 쉬운 진입점으로 줄이면서 긴 설명을 삭제하지 않고 아래 문서로 이동했습니다.
+
+| README에서 압축한 내용 | 상세 문서의 보존 위치 | 포함된 세부 내용 |
+|---|---|---|
+| 기능 요구사항과 상태 흐름 | [의사결정 기록](docs/investigation-log.md), [아키텍처](docs/architecture.md) | 업로드·메타데이터·비동기 처리·`PENDING/DONE/FAILED` |
+| 운영 서버 제약 조사 | [의사결정 기록](docs/investigation-log.md) | JVM flag, heap·metaspace, 서버 RAM, swap, 프록시 제한 |
+| S3 GET 절감 가설 | [의사결정 기록](docs/investigation-log.md) | inline queue, object key 경로, 메모리 예산과 가설의 위험 |
+| Workbook 기준 코드와 측정법 | [실험 보고서](docs/experiment-report.md) | 실험 질문, 단계별 측정 지점, 원시 JSON 기록과 수치 정의 |
+| 입력 크기별 전체 결과 | [실험 보고서](docs/experiment-report.md), [Workbook CSV](results/workbook-measurements.csv) | 1k·5k·20k·50k 행, Xmx별 성공·OOM, 시간·heap·JSON 크기 |
+| SAX 전환과 streaming output | [아키텍처](docs/architecture.md), [실험 보고서](docs/experiment-report.md) | sheet event 처리, 행 정렬, 값 변환, `JsonGenerator`, buffer와 임시 파일 |
+| GC 로그 비교 | [실험 보고서](docs/experiment-report.md), [GC CSV](results/gc-observations.csv) | 20k·50k 이벤트, pause, Full GC·OOM 여부, Workbook과의 회수 패턴 차이 |
+| 트랜잭션·동시성·복구 | [아키텍처](docs/architecture.md) | commit 이후 작업 발행, 공유 semaphore, backpressure, idempotency, 임시 파일 정리 |
+| 결과 적용 범위와 운영 검증 | [검증 범위와 후속 확인](docs/limitations-and-next-steps.md) | 합성 입력·단일 실행·정합성·동시 처리·비용·지원 상한의 검증 계획 |
+| 당시 기록과 공개 재현의 구분 | [실험 보고서](docs/experiment-report.md), [검증 범위와 후속 확인](docs/limitations-and-next-steps.md) | 회사 연구 기록의 보존 범위와 이후 벤치마크 분리 원칙 |
 
 ## 공개 범위
 
