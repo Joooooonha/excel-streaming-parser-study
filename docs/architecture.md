@@ -65,31 +65,31 @@ queued byte[] becomes collectible
 
 큐가 참조하고 있는 동안 GC는 파일 데이터를 회수할 수 없습니다.
 
-## 4. 수정 구조
+## 4. 최종 이중 경로 구조
 
 ### 핵심 원칙
 
 1. HTTP 요청과 파싱 실행 분리
-2. durable job에는 원본 byte array가 아닌 식별자 전달
-3. 전체 Workbook을 만들지 않는 SAX 처리
-4. 전체 결과를 모으지 않는 streaming output
+2. 검증된 소형 파일은 bounded inline queue에서 업로드 byte array 재사용
+3. 대형·queue 포화·재시도는 object key 기반 durable job으로 fallback
+4. 두 경로 모두 SAX 행 단위 파싱과 streaming output 적용
 5. 전체 parser 공유 동시성 제한
 6. 최종 저장과 상태 전환의 일관성 보장
 
 ```mermaid
 flowchart TD
-    A["HTTP upload"] --> B["object storage PUT"]
-    B --> C["DB metadata<br>PENDING"]
-    C --> D["after commit event"]
-    D --> E["durable job<br>id + object key"]
-    E --> F["bounded worker"]
-    F --> G["open object stream"]
-    G --> H["SAX row parser"]
-    H --> I["JsonGenerator"]
-    I --> J["buffered temp file"]
-    J --> K{"final persist"}
-    K -->|success| L["DONE"]
-    K -->|failure| M["FAILED"]
+    A["HTTP upload byte[]"] --> B["object storage PUT"]
+    B --> C["DB metadata · PENDING"]
+    C --> D{"inline eligible?"}
+    D -->|small + capacity| E["bounded inline queue · byte[]"]
+    D -->|large/full/retry| F["durable job · id + key"]
+    F --> G["object storage GET"]
+    E --> H["global parse permits"]
+    G --> H
+    H --> I["SAX + streaming output"]
+    I --> J{"final persist"}
+    J -->|success| K["DONE"]
+    J -->|failure| L["FAILED"]
 ```
 
 ## 5. 트랜잭션 경계
@@ -99,13 +99,16 @@ flowchart TD
 ```java
 @Transactional
 public ExcelUploadResponse upload(MultipartFile file) {
-    StoredObject stored = objectStorage.put(file);
+    byte[] uploadedBytes = file.getBytes();
+    StoredObject stored = objectStorage.put(uploadedBytes);
     ExcelRecord record = repository.save(
         ExcelRecord.pending(stored.key(), file.getOriginalFilename())
     );
 
     eventPublisher.publishEvent(
-        new ExcelUploadedEvent(record.getId(), stored.key())
+        new ExcelUploadedEvent(
+            record.getId(), stored.key(), uploadedBytes, file.getSize()
+        )
     );
 
     return ExcelUploadResponse.from(record);
@@ -115,14 +118,18 @@ public ExcelUploadResponse upload(MultipartFile file) {
 ```java
 @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
 public void enqueue(ExcelUploadedEvent event) {
-    durableQueue.publish(new ExcelParseJob(
-        event.excelId(),
-        event.objectKey()
-    ));
+    if (inlinePolicy.isEligible(event)
+            && inlineQueue.offer(InlineParseJob.from(event))) {
+        return;
+    }
+
+    durableQueue.publish(DurableParseJob.from(event));
 }
 ```
 
-위 코드는 공개용 설계 스케치입니다. 실제 운영 구현이 아닙니다.
+위 코드는 공개용 설계 스케치입니다. 실제 운영 코드를 복사한 것이 아닙니다.
+
+초기 inline 조건은 압축 크기 `1MiB` 이하이면서 업로드 단계에서 5,000행·100,020셀 이하임을 검증할 수 있는 입력입니다. 행·셀 정보를 알 수 없으면 inline으로 추정하지 않고 durable 경로로 보냅니다. 모든 원본은 먼저 object storage에 저장되므로 queue 포화·실패·재시도 때 key 기반으로 복구할 수 있습니다.
 
 ### 실패 순서
 
@@ -257,18 +264,7 @@ try {
 
 ## 9. 동시성 제한
 
-### 잘못된 분리
-
-```text
-inlinePool.max = 2
-deferredPool.max = 1
-
-실제 최대 동시 parser = 3
-```
-
-각 pool은 다른 pool의 실행을 모르기 때문에 전체 메모리 예산을 초과할 수 있습니다.
-
-### 공유 제한
+### 두 경로의 공유 제한
 
 ```mermaid
 flowchart TD
@@ -277,13 +273,11 @@ flowchart TD
     C --> D["SAX workers"]
 ```
 
+queue별 worker 수를 따로 제한하면 합산 동시성이 예산을 넘을 수 있으므로 두 경로가 같은 permit을 사용합니다.
+
 ```java
 final class ParseAdmissionController {
-    private final Semaphore permits;
-
-    ParseAdmissionController(int totalPermits) {
-        this.permits = new Semaphore(totalPermits, true);
-    }
+    private final Semaphore permits = new Semaphore(2, true);
 
     <T> T execute(int weight, Callable<T> task) throws Exception {
         permits.acquire(weight);
@@ -296,31 +290,24 @@ final class ParseAdmissionController {
 }
 ```
 
-### 초기 permit 계산
+### 초기 permit과 queue 계산
 
 ```text
 MaxHeap                         = 478MiB
-25% 안전 여유를 제외한 예산       = 358.5MiB
-baseline                        = 73MiB
-large 증가분                    = 222 - 73 = 149MiB
-small 증가분의 보수적 근사        = 124.3MiB
-
-small 2건 = 73 + 124.3 × 2 = 321.6MiB
-large 2건 = 73 + 149 × 2   = 371.0MiB
+25% 안전 여유 적용 예산          = 478 × 0.75 = 358.5MiB
+baseline/post-GC 관측 상한       = 73MiB
+small 증가량 proxy              = 124.3MiB
+large SAX 증가량                = 222 - 73 = 149MiB
+inline raw queue                = 1MiB × 4 = 4MiB
 ```
 
-따라서 초기 admission 정책은 다음과 같습니다.
+| 실행 조합 | 계산 | 판단 |
+|---|---:|---|
+| small 2 + queue | `73 + 124.3×2 + 4 = 325.6MiB` | 허용, 여유 32.9MiB |
+| large 1 + small 1 + queue | `73 + 149 + 124.3 + 4 = 350.3MiB` | 여유 8.2MiB로 제외 |
+| large 2 + queue | `73 + 149×2 + 4 = 375MiB` | 예산 초과 |
 
-| 구분 | 값 |
-|---|---:|
-| total permits | 2 |
-| small job weight | 1 |
-| large job weight | 2 |
-| 최대 동시 실행 | small 2건 또는 large 1건 |
-
-`small`은 사전 검증으로 5,000행·100,020셀 이하가 확인된 입력만 해당합니다. 알 수 없는 입력과 그보다 큰 입력은 `large`로 분류해 permit 2개를 모두 사용합니다. `large + small`의 계산값은 346.3MiB로 358.5MiB 예산 안에 들어오지만 여유가 12.2MiB에 불과하므로 허용하지 않습니다.
-
-이 값은 단일 실행의 관측값에서 도출한 보수적 초기 설정입니다. 동시 실행 throughput이나 p95 지연을 측정한 값은 아니므로 운영 telemetry로 재검토합니다.
+따라서 초기값은 `total permits=2`, `small weight=1`, `large weight=2`, `inline queue capacity=4`입니다. 즉 small 2건 또는 large 1건만 동시에 실행합니다. 이는 운영 부하 시험으로 찾은 최적값이 아니라 단일 실행 관측값과 25% 안전 여유로 계산한 admission policy입니다.
 
 ## 10. Backpressure
 
@@ -411,9 +398,10 @@ parser_worker_max: 2
 parse_permits: 2
 small_job_weight: 1
 large_job_weight: 2
-executor_queue_capacity: 4
-inline_raw_byte_queue_capacity: 0
-queue_payload: id_and_object_key
+inline_queue_capacity: 4
+inline_threshold: "1MiB"
+inline_validated_profile: "up to 5,000 rows / 100,020 cells"
+durable_fallback: id_and_object_key
 
 max_upload_size: validate_with_real_workbooks
 max_rows: validate_with_real_workbooks
@@ -423,4 +411,4 @@ result_storage: decide_with_product_policy
 retry_policy: decide_with_failure_policy
 ```
 
-파싱 방식과 JVM admission의 초기값은 위와 같이 정리했습니다. 실제 처리량·queue wait·장애율·비용, 최종 지원 파일 범위는 [운영 적용을 위한 검증 계획](limitations-and-next-steps.md)에 따라 실제 트래픽과 end-to-end 경로에서 확인합니다.
+permit, queue와 inline 값은 관측치에서 도출한 초기 설정입니다. 실제 처리량·queue wait·장애율·전체 비용과 최종 지원 파일 범위는 [운영 적용을 위한 검증 계획](limitations-and-next-steps.md)에 따라 실제 트래픽과 end-to-end 경로에서 확인합니다.
