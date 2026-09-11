@@ -4,7 +4,7 @@
 
 ## 1. 연구 결과의 적용 범위
 
-이 저장소는 인턴십 중 수행한 로컬 파서 실험과 설계 검토를 공개 가능한 형태로 재구성한 기술 사례입니다. 연구 질문, 조건, 측정값과 판단 과정은 보존하고 회사 코드·고객 데이터·내부 식별 정보만 제거하거나 일반화했습니다.
+이 저장소는 인턴십 중 수행한 Excel 업로드·파싱 기능 구현, 로컬 파서 실험과 설계 개선을 공개 가능한 형태로 재구성한 기술 사례입니다. 연구 질문, 조건, 측정값과 판단 과정은 보존하고 회사 코드·고객 데이터·내부 식별 정보만 제거하거나 일반화했습니다.
 
 ### 이번 연구에서 확인한 내용
 
@@ -13,11 +13,11 @@
 - 같은 입력의 SAX 스트리밍 실행이 `-Xmx512m`에서 완료
 - 원본 `byte[]`보다 파싱 객체와 전체 결과가 더 큰 위험으로 관측됨
 - 출력까지 스트리밍하고 전체 parser 동시성을 제한해야 한다는 설계 근거 확보
+- 관측값과 25% heap 여유를 기준으로 small 2건 또는 large 1건, executor queue 4건의 초기 admission 값 계산
 
 ### 운영 적용 단계에서 별도로 확인할 내용
 
-- 운영 시스템의 SAX 구조 반영 여부
-- 배포 이후 장애율 변화
+- 실제 배포 범위와 배포 이후 장애율 변화
 - 반복·동시 실행의 처리량과 지연
 - 실제 AWS 청구 비용 변화
 - 안전한 최대 행·셀·출력 크기
@@ -205,10 +205,10 @@ safe limit
 - [ ] max RSS
 - [ ] GC count·total pause·max pause
 
-### 4단계: 동시 처리
+### 4단계: 계산한 동시성 값 검증
 
 - [ ] worker 1 기준 확인
-- [ ] 안전 후보만 worker 2 실행
+- [ ] 초기값인 small worker 2와 large worker 1 실행
 - [ ] 완료·실패 건수
 - [ ] throughput과 p50/p95 latency
 - [ ] queue wait time과 backpressure
@@ -221,20 +221,28 @@ safe limit
 - [ ] timeout·retry·duplicate 검증
 - [ ] 프로세스 재시작 복구
 
-### 6단계: 정책 확정
+### 6단계: 초기값 보정과 운영 정책 확정
 
 ```yaml
 supported_file_types: [.xlsx]
+parser_worker_max: 2
+parse_permits: 2
+small_job_weight: 1
+large_job_weight: 2
+executor_queue_capacity: 4
+inline_raw_byte_queue_capacity: 0
+queue_payload: id_and_object_key
+
 max_compressed_bytes: TBD
 max_uncompressed_bytes: TBD
 max_rows: TBD
 max_cells: TBD
 max_output_bytes: TBD
-worker_count: TBD
-queue_capacity: TBD
 retry_limit: TBD
 result_storage: TBD
 ```
+
+위 동시성·queue 수치는 기록된 heap 값으로 계산한 초기 admission 설정입니다. 실제 트래픽에서의 처리량·p95 지연·queue wait·장애율과 비용 절감 효과는 아직 측정값이 아니며, 운영 telemetry에 따라 더 낮추거나 높입니다.
 
 ## 11. 기록 보존과 공개 재현
 
