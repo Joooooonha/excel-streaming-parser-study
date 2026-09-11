@@ -2,7 +2,7 @@
 
 > [README](../README.md) · [실험 보고서](experiment-report.md) · [아키텍처](architecture.md) · [검증 범위와 후속 확인](limitations-and-next-steps.md)
 
-이 문서는 엑셀 업로드·파싱 기능을 검토하면서 질문과 판단이 어떻게 바뀌었는지 시간순으로 정리합니다. 완성된 답만 나열하기보다 가설, 확인 방법, 반례와 설계 전환을 남기는 것이 목적입니다.
+이 문서는 엑셀 업로드·파싱 기능을 구현하고 개선하면서 질문과 판단이 어떻게 바뀌었는지 시간순으로 정리합니다. 완성된 답만 나열하기보다 가설, 확인 방법, 반례와 설계 전환을 남기는 것이 목적입니다.
 
 > 회사의 내부 코드, 고객 데이터, 서버 식별 정보와 구성원 이름은 제외했습니다. 일부 수치는 당시 기록에서 확인한 관측값이며 운영 전체를 대표하지 않습니다.
 
@@ -209,7 +209,17 @@ small parse  → permit 1
 large parse  → 모든 permit
 ```
 
-이 구조는 대용량 파싱 중 다른 파서가 함께 실행되는 것을 막을 수 있지만, permit 수는 동시 처리 실험 전까지 최종값으로 정할 수 없습니다.
+관측값을 기준으로 MaxHeap 478MiB의 25%를 여유로 두면 파싱에 사용할 예산은 358.5MiB입니다. GC 뒤 관측 baseline 73MiB, large SAX의 GC 직전 222MiB, small 상한 근사로 Workbook 5,000행의 heap 증가 124.3MiB를 사용해 다음처럼 계산했습니다.
+
+```text
+large 증가분          = 222 - 73 = 149MiB
+large 2건             = 73 + 149 × 2 = 371.0MiB  → 예산 초과
+large 1건 + small 1건 = 73 + 149 + 124.3 = 346.3MiB
+                       → 여유가 12.2MiB뿐이므로 제외
+small 2건             = 73 + 124.3 × 2 = 321.6MiB → 예산 내
+```
+
+이 계산에 따라 공유 permit은 2, small weight는 1, large weight는 2로 정리했습니다. 사전 검증으로 5,000행·100,020셀 이하가 확인된 입력만 small로 분류하고, 알 수 없는 입력은 large로 처리합니다. 즉 초기 상한은 **small 2건 또는 large 1건**입니다. small 값은 SAX 동시 실행 실측이 아니라 더 무거운 Workbook 측정값을 사용한 보수적 근사이므로, 운영 최적값이 아니라 첫 적용을 위한 admission 설정입니다.
 
 ## 8. SAX 조사와 구현 방향
 
@@ -319,28 +329,34 @@ Workbook 20,000행 로그에서는 GC가 약 30회 발생하고 일부 GC 뒤에
 - 결과 저장 성공 뒤 `DONE` 전환
 - 실패 사유 기록과 임시 파일 정리
 
-### 설계 결론과 분리한 운영 지표
+### 계산 결과와 분리한 운영 지표
 
 - S3 비용을 특정 비율로 절감했다
 - SAX가 항상 더 빠르다
 - 50,000행을 운영 상한으로 지원할 수 있다
-- worker 2개가 안전하다
+- 동시 small 2건의 운영 안정성이 검증됐다
 - 운영 배포가 완료됐다
 
-## 12. 운영 적용 단계의 결정 항목
+## 12. 초기 적용 값과 운영 검증 항목
 
-파싱 구조는 SAX와 출력 스트리밍으로 결정했습니다. 아래 값은 서비스 트래픽과 배포 환경을 포함한 운영 검증 뒤 별도로 정할 정책입니다.
+파싱 구조와 JVM 내부 admission의 초기값은 당시 관측값으로 계산했습니다. 반면 실제 서비스의 지원 상한과 비용 효과는 트래픽·배포 환경을 포함해야 하므로 별도로 확인합니다.
 
-```text
-최대 업로드 조건 = 운영 검증 후 결정
-worker 수         = 운영 검증 후 결정
-queue capacity    = 운영 검증 후 결정
-inline threshold  = 운영 검증 후 결정
-결과 저장 위치    = 제품 정책과 함께 결정
-운영 반영 범위    = 별도 배포 결정으로 확인
+```yaml
+parser_worker_max: 2
+parse_permits: 2
+small_job_weight: 1
+large_job_weight: 2
+executor_queue_capacity: 4
+inline_raw_byte_queue_capacity: 0
+queue_payload: id_and_object_key
+
+max_upload_size: validate_with_real_workbooks
+max_rows_and_cells: validate_with_real_workbooks
+end_to_end_throughput: validate_with_real_traffic
+cost_effect: validate_after_deployment
 ```
 
-이 구분은 연구가 미완성이라는 뜻이 아닙니다. 파서 선택이라는 기술 결론과, 반복 실행·동시 요청·결과 저장 비용·안전 여유가 필요한 운영 상한을 분리한 것입니다.
+queue 4건은 처리량 측정으로 찾은 최적값이 아니라 worker 상한의 2배만 JVM executor에 대기시키는 backpressure 정책입니다. 더 많은 작업은 raw bytes가 아니라 durable `PENDING` 상태로 남깁니다. 이 구분은 구현이 끝나지 않았다는 뜻이 아니라, **관측값으로 계산한 자원 상한**과 **실제 트래픽에서 측정할 처리량·지연·비용**을 서로 바꾸어 말하지 않기 위한 것입니다.
 
 ## 기록의 의미
 
