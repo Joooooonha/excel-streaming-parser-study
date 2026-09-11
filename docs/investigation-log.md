@@ -63,7 +63,7 @@ flowchart TD
     F -->|아니오| G["deferred object key"]
 ```
 
-이 단계의 설계는 아직 측정 전 가설이었습니다.
+업로드 `byte[]`를 inline 작업에 전달하는 경로를 구현해 해당 파일의 S3 GET을 생략했습니다. 다만 어떤 크기까지 재사용할지, queue와 동시 작업을 몇 건으로 제한할지는 측정 전이라 확정하지 못했습니다.
 
 ## 3. 가설의 위험 확인
 
@@ -193,33 +193,22 @@ Spring, S3와 DB를 제외하고 파싱 자체의 메모리 비용을 확인하�
 
 ## 7. 동시성 판단의 변화
 
-처음에는 inline queue의 파일 수를 작게 제한하면 충분하다고 생각했습니다. 측정 뒤에는 running parser가 차지하는 메모리가 더 중요하다는 점을 확인했습니다.
+처음에는 inline queue의 파일 수만 제한하면 충분하다고 생각했습니다. 측정 뒤에는 running parser가 차지하는 메모리가 더 중요하다는 점을 확인해, inline과 durable 경로가 같은 permit을 사용하도록 설계를 바꿨습니다.
 
 ```text
-위험한 상황
-inline worker 2개
-+ deferred worker 1개
-= 서로 독립적으로 동시에 Workbook 3개 생성
+MaxHeap                   = 478MiB
+25% 여유 적용 예산         = 358.5MiB
+baseline                 = 73MiB
+large SAX 증가분          = 222 - 73 = 149MiB
+small 보수적 proxy        = 124.3MiB
+inline 대기 원본          = 1MiB × 4 = 4MiB
+
+small 2 + queue          = 325.6MiB → 허용
+large 1 + small 1 + queue= 350.3MiB → 여유 8.2MiB, 제외
+large 2 + queue          = 375.0MiB → 예산 초과
 ```
 
-따라서 queue별 worker 수가 아니라 모든 파싱 경로가 공유하는 제한이 필요하다고 판단했습니다.
-
-```text
-small parse  → permit 1
-large parse  → 모든 permit
-```
-
-관측값을 기준으로 MaxHeap 478MiB의 25%를 여유로 두면 파싱에 사용할 예산은 358.5MiB입니다. GC 뒤 관측 baseline 73MiB, large SAX의 GC 직전 222MiB, small 상한 근사로 Workbook 5,000행의 heap 증가 124.3MiB를 사용해 다음처럼 계산했습니다.
-
-```text
-large 증가분          = 222 - 73 = 149MiB
-large 2건             = 73 + 149 × 2 = 371.0MiB  → 예산 초과
-large 1건 + small 1건 = 73 + 149 + 124.3 = 346.3MiB
-                       → 여유가 12.2MiB뿐이므로 제외
-small 2건             = 73 + 124.3 × 2 = 321.6MiB → 예산 내
-```
-
-이 계산에 따라 공유 permit은 2, small weight는 1, large weight는 2로 정리했습니다. 사전 검증으로 5,000행·100,020셀 이하가 확인된 입력만 small로 분류하고, 알 수 없는 입력은 large로 처리합니다. 즉 초기 상한은 **small 2건 또는 large 1건**입니다. small 값은 SAX 동시 실행 실측이 아니라 더 무거운 Workbook 측정값을 사용한 보수적 근사이므로, 운영 최적값이 아니라 첫 적용을 위한 admission 설정입니다.
+이 계산으로 전체 permit 2, small weight 1, large weight 2, inline queue 4건을 초기 기준으로 정했습니다. threshold `1MiB`는 관측한 5,000행 합성 파일 `0.580MiB`를 위로 둥글린 routing 시작값입니다. 실제 동시 처리량으로 최적화한 수치는 아니므로 운영 telemetry로 재검토합니다.
 
 ## 8. SAX 조사와 구현 방향
 
@@ -320,43 +309,41 @@ Workbook 20,000행 로그에서는 GC가 약 30회 발생하고 일부 GC 뒤에
 
 ## 11. 최종 판단
 
-### 채택할 방향
+### 채택한 방향
 
 - `.xlsx` 기본 파싱은 SAX event 방식
 - 행 단위 처리 후 즉시 streaming output
-- 대용량 작업은 raw bytes가 아닌 id와 object key 전달
-- 전체 parser 공유 동시성 제한
+- 검증된 소형 파일은 bounded inline queue에서 업로드 raw bytes 재사용
+- 대형·queue 포화·재시도는 id와 object key를 durable 경로로 전달
+- 모든 파싱 경로가 공유 permit 사용
 - 결과 저장 성공 뒤 `DONE` 전환
 - 실패 사유 기록과 임시 파일 정리
 
-### 계산 결과와 분리한 운영 지표
+### 확대하지 않은 단정
 
-- S3 비용을 특정 비율로 절감했다
+- 전체 AWS 청구 비용을 50% 절감했다
 - SAX가 항상 더 빠르다
 - 50,000행을 운영 상한으로 지원할 수 있다
-- 동시 small 2건의 운영 안정성이 검증됐다
-- 운영 배포가 완료됐다
+- 동시 small 2건이 실제 트래픽의 최적값이다
 
 ## 12. 초기 적용 값과 운영 검증 항목
-
-파싱 구조와 JVM 내부 admission의 초기값은 당시 관측값으로 계산했습니다. 반면 실제 서비스의 지원 상한과 비용 효과는 트래픽·배포 환경을 포함해야 하므로 별도로 확인합니다.
 
 ```yaml
 parser_worker_max: 2
 parse_permits: 2
 small_job_weight: 1
 large_job_weight: 2
-executor_queue_capacity: 4
-inline_raw_byte_queue_capacity: 0
-queue_payload: id_and_object_key
+inline_queue_capacity: 4
+inline_threshold: "1MiB"
+durable_fallback: id_and_object_key
 
 max_upload_size: validate_with_real_workbooks
 max_rows_and_cells: validate_with_real_workbooks
 end_to_end_throughput: validate_with_real_traffic
-cost_effect: validate_after_deployment
+overall_cost_effect: validate_after_deployment
 ```
 
-queue 4건은 처리량 측정으로 찾은 최적값이 아니라 worker 상한의 2배만 JVM executor에 대기시키는 backpressure 정책입니다. 더 많은 작업은 raw bytes가 아니라 durable `PENDING` 상태로 남깁니다. 이 구분은 구현이 끝나지 않았다는 뜻이 아니라, **관측값으로 계산한 자원 상한**과 **실제 트래픽에서 측정할 처리량·지연·비용**을 서로 바꾸어 말하지 않기 위한 것입니다.
+inline 파일은 S3 접근이 `PUT + GET` 2회에서 `PUT` 1회로 줄어 접근 횟수 기준 50% 감소했습니다. 전체 AWS 비용 감소율은 inline hit ratio, 요청 단가, 저장·전송·다른 서비스 비용을 포함해 운영에서 확인해야 합니다. 이 구분은 미완료를 뜻하는 것이 아니라, **구현한 구조·계산한 초기값**과 **운영에서 측정할 KPI**를 바꾸어 말하지 않기 위한 것입니다.
 
 ## 기록의 의미
 
