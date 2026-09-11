@@ -296,7 +296,31 @@ final class ParseAdmissionController {
 }
 ```
 
-대용량 작업에 더 많은 permit을 요구하는 방식은 한 가지 후보일 뿐입니다. 입력 크기와 실제 parser live set 사이의 관계를 반복 측정하기 전에는 weight를 확정하지 않습니다.
+### 초기 permit 계산
+
+```text
+MaxHeap                         = 478MiB
+25% 안전 여유를 제외한 예산       = 358.5MiB
+baseline                        = 73MiB
+large 증가분                    = 222 - 73 = 149MiB
+small 증가분의 보수적 근사        = 124.3MiB
+
+small 2건 = 73 + 124.3 × 2 = 321.6MiB
+large 2건 = 73 + 149 × 2   = 371.0MiB
+```
+
+따라서 초기 admission 정책은 다음과 같습니다.
+
+| 구분 | 값 |
+|---|---:|
+| total permits | 2 |
+| small job weight | 1 |
+| large job weight | 2 |
+| 최대 동시 실행 | small 2건 또는 large 1건 |
+
+`small`은 사전 검증으로 5,000행·100,020셀 이하가 확인된 입력만 해당합니다. 알 수 없는 입력과 그보다 큰 입력은 `large`로 분류해 permit 2개를 모두 사용합니다. `large + small`의 계산값은 346.3MiB로 358.5MiB 예산 안에 들어오지만 여유가 12.2MiB에 불과하므로 허용하지 않습니다.
+
+이 값은 단일 실행의 관측값에서 도출한 보수적 초기 설정입니다. 동시 실행 throughput이나 p95 지연을 측정한 값은 아니므로 운영 telemetry로 재검토합니다.
 
 ## 10. Backpressure
 
@@ -307,7 +331,15 @@ producer rate > parser throughput
 → retry/duplicate risk grows
 ```
 
-필요한 정책:
+초기 executor queue는 worker 상한의 2배인 **4 jobs**로 제한합니다. queue payload에는 원본 `byte[]`가 아니라 id와 object key만 넣고, 그보다 많은 작업은 durable `PENDING` 상태로 남겨 JVM 내부 대기열이 무한히 자라지 않게 합니다.
+
+```text
+parser_worker_max       = 2
+executor_queue_capacity = parser_worker_max × 2 = 4
+inline_raw_byte_queue   = disabled
+```
+
+함께 필요한 정책:
 
 - queue depth 경보
 - 최대 대기 시간
@@ -372,18 +404,23 @@ heap/RSS/GC metrics
 
 로그에 원본 파일명, cell 값과 사용자 개인정보를 남기지 않습니다.
 
-## 14. 운영 적용 단계의 정책 값
+## 14. 초기 적용 값과 운영 확인 값
 
 ```yaml
-max_upload_size: decide_after_validation
-max_rows: decide_after_validation
-max_cells: decide_after_validation
+parser_worker_max: 2
+parse_permits: 2
+small_job_weight: 1
+large_job_weight: 2
+executor_queue_capacity: 4
+inline_raw_byte_queue_capacity: 0
+queue_payload: id_and_object_key
+
+max_upload_size: validate_with_real_workbooks
+max_rows: validate_with_real_workbooks
+max_cells: validate_with_real_workbooks
 max_output_bytes: decide_after_validation
-parser_workers: decide_after_validation
-queue_capacity: decide_after_validation
-inline_threshold: decide_after_validation
 result_storage: decide_with_product_policy
 retry_policy: decide_with_failure_policy
 ```
 
-파싱 방식은 SAX와 출력 스트리밍으로 정리됐으며, 이 값들은 [운영 적용을 위한 검증 계획](limitations-and-next-steps.md)에 따라 트래픽·자원·복구 정책을 함께 측정한 뒤 정합니다.
+파싱 방식과 JVM admission의 초기값은 위와 같이 정리했습니다. 실제 처리량·queue wait·장애율·비용, 최종 지원 파일 범위는 [운영 적용을 위한 검증 계획](limitations-and-next-steps.md)에 따라 실제 트래픽과 end-to-end 경로에서 확인합니다.
