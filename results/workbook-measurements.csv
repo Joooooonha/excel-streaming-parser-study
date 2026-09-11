@@ -1,0 +1,7 @@
+parser,sample,rows,cells,file_size_mib,xmx_mib,result,read_ms,parse_ms,json_ms,total_ms,heap_before_bytes,heap_after_read_bytes,heap_after_parse_bytes,heap_after_json_bytes,heap_delta_after_parse_bytes,parsed_json_size_bytes,measurement_note
+workbook,realistic-1k,1000,20020,0.119,512,success,107,1171,78,1358,19360568,19360568,89790368,92666984,70429800,255160,single-run-checkpoint-used-heap
+workbook,realistic-5k,5000,100020,0.580,512,success,105,2158,118,2383,19359144,20407720,149734912,155587392,130375768,1282545,single-run-checkpoint-used-heap
+workbook,realistic-20k,20000,400020,2.306,512,success-near-limit,14,6547,148,6713,19356736,22502464,448010752,400556752,428654016,5153760,single-run-checkpoint-used-heap
+workbook,realistic-50k,50000,1000020,5.753,512,oom,,,,,,,,,,,single-run
+workbook,realistic-50k,50000,1000020,5.753,768,oom,,,,,,,,,,,single-run
+workbook,realistic-50k,50000,1000020,5.753,1024,success-near-limit,7,9079,296,9384,19360856,25652312,1034137600,984088704,1014776744,12914543,single-run-checkpoint-used-heap
