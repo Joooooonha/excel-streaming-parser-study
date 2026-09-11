@@ -1,0 +1,4 @@
+parser,sample,rows,cells,file_size_mib,xms_mib,xmx_mib,result,observed_heap_before_gc_mib,observed_heap_after_gc_mib,full_gc,oom,gc_pause_observation_ms,note
+sax-streaming,realistic-20k,20000,400020,2.306,256,512,success,222,73,no,no,3-5,gc-event-observation-not-exact-peak
+sax-streaming,realistic-50k,50000,1000020,5.753,256,512,success,217,69,no,no,3-6,gc-event-observation-not-exact-peak
+workbook,realistic-20k,20000,400020,2.306,256,512,success,,,,no,not-summarized,about-30-gc-events-and-small-reclamation-in-sampled-events
