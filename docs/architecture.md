@@ -1,5 +1,7 @@
 # 아키텍처 설계
 
+> [README](../README.md) · [의사결정 기록](investigation-log.md) · [실험 보고서](experiment-report.md) · [검증 범위와 후속 확인](limitations-and-next-steps.md)
+
 ## 1. 범위
 
 이 문서는 엑셀 업로드 요청, 비동기 파싱, 결과 저장과 상태 조회를 분리한 설계안을 설명합니다. 특정 회사의 실제 인프라 토폴로지나 운영 코드는 포함하지 않습니다.
@@ -370,18 +372,18 @@ heap/RSS/GC metrics
 
 로그에 원본 파일명, cell 값과 사용자 개인정보를 남기지 않습니다.
 
-## 14. 확정되지 않은 값
+## 14. 운영 적용 단계의 정책 값
 
 ```yaml
-max_upload_size: not-decided
-max_rows: not-decided
-max_cells: not-decided
-max_output_bytes: not-decided
-parser_workers: not-decided
-queue_capacity: not-decided
-inline_threshold: not-decided
-result_storage: not-decided
-retry_policy: not-decided
+max_upload_size: decide_after_validation
+max_rows: decide_after_validation
+max_cells: decide_after_validation
+max_output_bytes: decide_after_validation
+parser_workers: decide_after_validation
+queue_capacity: decide_after_validation
+inline_threshold: decide_after_validation
+result_storage: decide_with_product_policy
+retry_policy: decide_with_failure_policy
 ```
 
-이 값은 [후속 검증 계획](limitations-and-next-steps.md)의 실험을 완료한 뒤 정해야 합니다.
+파싱 방식은 SAX와 출력 스트리밍으로 정리됐으며, 이 값들은 [운영 적용을 위한 검증 계획](limitations-and-next-steps.md)에 따라 트래픽·자원·복구 정책을 함께 측정한 뒤 정합니다.
